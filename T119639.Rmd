@@ -1,0 +1,258 @@
+---
+title: Assessment of bucketing used for backend tests which report to CirrusSearchUserTesting
+  log
+author: "Mikhail Popov"
+date: "2 December 2015"
+output: 
+  pdf_document: 
+    highlight: kate
+---
+
+```{r setup, include = FALSE}
+options(scipen = 10)
+options(digits = 3)
+```
+
+## Summary
+
+After the experimental analysis of our previous A/B test (Language Switch test), we became concerned about our procedure of selecting users for testing and assigning them to experimental/control groups. While the web queries were evenly bucketed, API queries were not as evenly bucketed. In this assessment we validated the technique and showed that the users were evenly bucketed from both sources, but that heavy users of the API skewed the bucketing proportions as hypothesized.
+
+## Background (by Erik Bernhardson)
+
+The last analysis Oliver ran showed that the balance of requests for web were fairly even, but that significantly more requests ended up in bucket a for the API ([Source](https://github.com/wikimedia-research/LangTest/blob/master/events_by_source_summary.png)).
+
+This is most likely because we are using a consistent bucketing scheme. This scheme is:
+  
+1. Take the IP address + x-forwarded-for + user-agent, md5 them together using ':' separator (see [https://github.com/wikimedia/mediawiki-extensions-CirrusSearch/blob/master/includes/ElasticsearchIntermediary.php#L593](generateIdentToken()))
+2. Convert that 128 bit number to a floating point probability between 0 and 1 (see [https://github.com/wikimedia/mediawiki-extensions-CirrusSearch/blob/master/includes/UserTesting.php#L182](hexToProbability()))
+3. Accept all users that meet `1/$sampleRate >= $probability` (see [https://github.com/wikimedia/mediawiki-extensions-CirrusSearch/blob/master/includes/UserTesting.php#L207](oneIn()))
+
+Most likely the reason for the misbalance is that some users send 1 or 2 requests and some users send 100k requests. Those heavy users will bias whatever bucket they end up in.
+
+## Data Collection
+
+From the same report, we saw that 8 November 2015 was the busiest day, so we have decided to study the Cirrus search request logs from that particular date. We fetched a little over 41 million records via Hive. We kept a random sample of 1 million queries.
+
+```{r fetch_from_hive, eval = FALSE}
+queries <- paste("USE EBernhardson;
+SELECT ts, identity, source, day
+FROM CirrusSearchRequestSet
+WHERE year = 2015 AND month = 11 AND day =", sprintf("%02.0f", 8),
+"AND INSTR(requests.querytype[SIZE(requests.querytype)-1], 'full_text') > 0")
+hashes <- lapply(queries, function(query) {
+  cat("Running hive query:\n", query, "\n\n")
+  query_dump <- tempfile()
+  cat(query, file = query_dump)
+  results_dump <- tempfile()
+  try({
+    system(paste0("export HADOOP_HEAPSIZE=1024 && hive -S -f ", query_dump, " > ", results_dump))
+    results <- read.delim(results_dump, sep = "\t", quote = "", as.is = TRUE, header = TRUE)
+  })
+  file.remove(query_dump, results_dump)
+  return(results)
+})[[1]]
+hashes$day <- NULL
+hashes$timestamp <- as.POSIXct(as.numeric(as.character(hashes$ts)), origin = '1970-01-01', tz = 'GMT')
+hashes <- hashes[sample.int(nrow(hashes), 1e6), ]
+```
+
+Now that we have the identities hashes -- MD5(IP+XFF+UA) -- we need to replicate the hex-to-probability procedure. (We have verified the procedure to make sure it yields results identical to the PHP code linked to above.)
+
+```{r hex_to_prob, eval = FALSE}
+library(bitops) # install.packages('bitops')
+hex_to_prob <- function(hash) {
+  hash_sum <- 0
+  for ( i in seq(1, nchar(hash), 4) ) {
+    dec <- strtoi(substr(hash, i, i + 3), base = 16)
+    # // xor will retain the uniform distribution
+    hash_sum <- bitXor(hash_sum, dec)
+  }
+  return(hash_sum / (bitShiftL(1, 16) - 1))
+}
+hashes$probability <- sapply(hashes$identity, hex_to_prob)
+```
+
+Next we replicate the procedure for selecting a query to be included in the test, and, if selected, which bucket to place it in. This is a deterministic process dependent on the probability derived above.
+
+```{r one_in, eval = FALSE}
+one_in <- function(probs, sample_rate) {
+  rate_threshold <- 1/sample_rate
+  temp <- numeric(length(probs))
+  temp[rate_threshold >= probs] <- probs[probs < rate_threshold] / rate_threshold
+  return(temp)
+}
+hashes$group <- 'not in test'
+hashes$bucket_probability <- one_in(hashes$probability, 10)
+hashes$group[1/10 >= hashes$probability] <- 'in test'
+hashes$group[hashes$group == 'in test' & hashes$bucket_probability < 0.5] <- 'control'
+hashes$group[hashes$group == 'in test' & hashes$bucket_probability >= 0.5] <- 'test'
+```
+
+```{r save_data, eval = FALSE, echo = FALSE}
+readr::write_csv(hashes, '~/CirrusSearchRequestSetSubset.csv')
+```
+
+## Analysis
+
+```{r read_data, echo = FALSE}
+hashes <- readr::read_csv('~/Documents/Data/CirrusSearchRequestSetSubset.csv.gz', col_types = "-ccTddlcd")
+```
+
+```{r utils, include = FALSE}
+library(magrittr)
+library(tidyr)
+import::from(dplyr, select, arrange, mutate, group_by, summarize, keep_where = filter)
+library(ggplot2)
+library(BCDA)
+```
+
+```{r eda_1, echo = FALSE, fig.width = 3, fig.height = 3}
+ggplot(data = keep_where(hashes, group != 'not in test'),
+       aes(x = group)) + geom_bar() + theme_bw() +
+  scale_y_continuous(name = "queries") +
+  ggtitle("Queries by bucket")
+```
+
+This is consistent with what we've been seeing in our previous tests. The hash-to-probability-to-bucketing pipeline does not yield evenly sized buckets *with respect to the volume of queries*.
+
+### Queries by Source and Group
+
+```{r eda_2, echo = FALSE, fig.width = 6, fig.height = 4}
+ggplot(data = keep_where(hashes, group != 'not in test'),
+       aes(x = source, fill = group)) +
+  geom_bar(position = "dodge") + theme_bw() +
+  scale_y_continuous(name = "queries") +
+  ggtitle("Queries by source and bucket (group)")
+```
+
+From this figure it is not clear whether the bucket splits are different betweeen the two sources.
+
+**Null Hypothesis (H0)**: Bucketing proportions are independent of source.
+
+```{r independence_1, echo = FALSE}
+hashes %>%
+  keep_where(group != 'not in test') %>%
+  with(table(source, group)) %T>%
+  { print(prop.table(., margin = 1)) } %>%
+  test_indepen
+```
+
+That is, there is strong evidence of association.
+
+```{r cda_1, echo = FALSE}
+hashes %>%
+  keep_where(group != 'not in test') %>%
+  with(table(source, group)) %>%
+  { rbind(PD = ci_prop_diff_tail(.),
+          RR = ci_relative_risk(.)) }
+```
+
+The proportion of API queries in the control bucket is 4.82-6.34% lesser than the proporton of web queries. API queries are 0.89-0.91 times less likely to end up in the 'test group' bucket than web queries. This is *NOT* to say that queries are more or less likely to end up in one bucket or the other, but that queries from one source are more/less likely to end up in a particular bucket than queries from another source.
+
+### Users by Source and Group
+
+One hypothesis is that API users send a lot more queries than web users do, so if a few very active API users are selected to be in the test, then the bucket they are (pseudo-randomly but essentially deterministically) assigned to will impact how many queries end up in the bucket.
+
+Let us examine how source and bucketing look like when we focus on users rather than queries.
+
+```{r eda_3, echo = FALSE, fig.width = 6, fig.height = 4}
+hashes %>%
+  keep_where(group != "not in test") %>%
+  dplyr::distinct(identity) %T>%
+  with(table(source, group)) %>%
+  ggplot(data = ., aes(x = source, fill = group)) +
+  geom_bar(position = "dodge") + theme_bw() +
+  scale_y_continuous(name = "users") +
+  ggtitle("Users by source and bucket (group)")
+```
+
+From this figure it's pretty clear that user bucketing is even across the two sources. We will again use the Bayes Factor to perform a Bayesian test of indendence.
+
+```{r independence_2, echo = FALSE}
+hashes %>%
+  keep_where(group != "not in test") %>%
+  dplyr::distinct(identity) %>%
+  with(table(source, group)) %T>%
+  { print(prop.table(., margin = 1)) } %>%
+  test_indepen
+```
+
+```{r cda_2, echo = FALSE}
+hashes %>%
+  keep_where(group != "not in test") %>%
+  dplyr::distinct(identity) %>%
+  with(table(source, group)) %>%
+  { rbind(PD = ci_prop_diff_tail(.),
+          RR = ci_relative_risk(.)) }
+```
+
+There we have it -- the test of independence says we don't have evidence of association, the proportion difference credible interval includes 0, and neither source is more or less likely than the other to have more in any one particular bucket. Clearly, the disparity/bias is coming from heavy users. Let's take a look at the volume of queries per user (Q.P.U).
+
+```{r eda_4, echo = FALSE}
+hashes %>%
+  keep_where(group != "not in test") %>%
+  group_by(source, group, identity) %>%
+  summarize(`queries per user` = n()) %>%
+  # dplyr::top_n(10, `queries per user`) %>%
+  # arrange(desc(`queries per user`))
+  summarize(`Users` = n(),
+            `Total Queries` = sum(`queries per user`),
+            `Maximum Q.P.U.` = max(`queries per user`),
+            `Median / Average` = sprintf("%.3f / %.3f",
+                                  median(`queries per user`),
+                                  mean(`queries per user`)),
+            `99th Percentile Q.P.U.` = quantile(`queries per user`, 0.99)) %>%
+  knitr::kable()
+```
+
+The buckets are actually not to so disparate once we remove the web user in the control group that's an outlier with 3,995 queries: 11,992 - 3,995 = 7,997 queries in control group vs 8,770 queries in test group -- which brings the buckets a lot more closer to each other, and more consistent with what Oliver saw in his analysis, wherein the buckets were even within the web users but disparate within the API users.
+
+### Top users by contribution to their respective bucket
+
+We computed the contribution weight of each user to their bucket and picked out the top 10 users within each bucket.
+
+```{r top_10_within_bucket, echo = FALSE}
+temp_1 <- hashes %>%
+  keep_where(group != "not in test") %>%
+  group_by(group, identity) %>%
+  summarize(`queries per user` = n()) %>%
+  mutate(weight = `queries per user`/sum(`queries per user`)) %>%
+  dplyr::top_n(20, weight) %>%
+  arrange(desc(weight)) %>%
+  dplyr::left_join(dplyr::distinct(select(hashes, c(source, identity))), by = "identity") %>%
+  select(-identity) %>%
+  select(c(group, source, `queries per user`, weight))
+temp_1 %>% dplyr::top_n(10, weight) %>% knitr::kable()
+```
+
+To little surprise, the list was dominated by API users. There is an outlier web user with 3995 queries to their name. We were curious whether there existed a relationship between bucketing and source among the users with the most contribution, so we picked top 20 users and employed Fisher's Exact Test to test the independence.
+
+```{r top_100_within_bucket, echo = FALSE}
+temp_1 %>% with(table(group, source)) %T>% print %>% fisher.test
+```
+
+We failed to reject the hypothesis (p = 0.09) that source is independent of bucketing. We also computed the contribution weight of each user to their source group and picked out the top 10 users within each source category.
+
+### Top users by contribution to their respective source group
+
+```{r top_10_within_source, echo = FALSE}
+temp_2 <- hashes %>%
+  keep_where(group != "not in test") %>%
+  group_by(source, identity) %>%
+  summarize(`queries per user` = n()) %>%
+  mutate(weight = `queries per user`/sum(`queries per user`)) %>%
+  dplyr::top_n(20, weight) %>%
+  arrange(desc(weight)) %>%
+  dplyr::left_join(dplyr::distinct(select(hashes, c(group, identity))), by = "identity") %>%
+  select(-identity) %>%
+  select(c(source, group, `queries per user`, weight))
+temp_2 %>% dplyr::top_n(10, weight) %>% knitr::kable()
+```
+
+It almost looked like the bucketing was actually kind of even among the top 10 users. So we decided to confirm this with Fisher's Exact Test for the top 20 most contributing users within each source category.
+
+```{r top_100_within_source, echo = FALSE}
+temp_2 %>% with(table(source, group)) %T>% print %>% fisher.test
+```
+
+We fail to reject the hypothesis (p = 0.2) that bucketing is independent of source among the top 20 API users and top 20 web users.
