@@ -2,7 +2,7 @@
 title: Assessment of bucketing used for backend tests which report to CirrusSearchUserTesting
   log
 author: "Mikhail Popov"
-date: "2 December 2015"
+date: "3 December 2015"
 output: 
   pdf_document: 
     highlight: kate
@@ -16,6 +16,8 @@ options(digits = 3)
 ## Summary
 
 After the experimental analysis of our previous A/B test (Language Switch test), we became concerned about our procedure of selecting users for testing and assigning them to experimental/control groups. While the web queries were evenly bucketed, API queries were not as evenly bucketed. In this assessment we validated the technique and showed that the users were evenly bucketed from both sources, but that heavy users of the API skewed the bucketing proportions as hypothesized.
+
+Going forward, if we are studying queries and regarding them as individual sampling units, then it is our highest recommendation to shift to a per-query sampling rather than a per-user sampling. In this report we show how bucketing looks like when the timestamp is included in the creation of the hex identity on which sampling and bucketing relies. That is, we should still include the user identity hash for grouping queries into sets if the analysis requires it, but we should add an additional field for query identity hash which is the one that we will use for sampling and bucketing. This is our recommendation until we switch to performing these kinds of tests through Relevance Labs.
 
 ## Background (by Erik Bernhardson)
 
@@ -58,7 +60,7 @@ hashes <- hashes[sample.int(nrow(hashes), 1e6), ]
 
 Now that we have the identities hashes -- MD5(IP+XFF+UA) -- we need to replicate the hex-to-probability procedure. (We have verified the procedure to make sure it yields results identical to the PHP code linked to above.)
 
-```{r hex_to_prob, eval = FALSE}
+```{r hex_to_prob}
 library(bitops) # install.packages('bitops')
 hex_to_prob <- function(hash) {
   hash_sum <- 0
@@ -69,18 +71,24 @@ hex_to_prob <- function(hash) {
   }
   return(hash_sum / (bitShiftL(1, 16) - 1))
 }
+```
+
+```{r assign_probability, eval = FALSE}
 hashes$probability <- sapply(hashes$identity, hex_to_prob)
 ```
 
 Next we replicate the procedure for selecting a query to be included in the test, and, if selected, which bucket to place it in. This is a deterministic process dependent on the probability derived above.
 
-```{r one_in, eval = FALSE}
+```{r one_in}
 one_in <- function(probs, sample_rate) {
   rate_threshold <- 1/sample_rate
   temp <- numeric(length(probs))
   temp[rate_threshold >= probs] <- probs[probs < rate_threshold] / rate_threshold
   return(temp)
 }
+```
+
+```{r bucket, eval = FALSE}
 hashes$group <- 'not in test'
 hashes$bucket_probability <- one_in(hashes$probability, 10)
 hashes$group[1/10 >= hashes$probability] <- 'in test'
@@ -256,3 +264,39 @@ temp_2 %>% with(table(source, group)) %T>% print %>% fisher.test
 ```
 
 We fail to reject the hypothesis (p = 0.2) that bucketing is independent of source among the top 20 API users and top 20 web users.
+
+## Query-wise bucketing
+
+Our tests so far have regarded each query as the sampling unit, with analysis done assuming each query is independently sampled. This is wrong, because the sampling is done at the user level. So if a single user with 100K queries is selected for a test, ALL of those queries are going into the group that the user is bucketed into. Let us see what happens when we use the timestamp in the identity creation, resulting in a per-query identity rather than a per-user identity.
+
+```{r}
+library(digest) # install.packages('digest')
+hashes$new_identity <- sapply(paste(hashes$identity, hashes$timestamp, sep = ':'),
+                         digest, algo = 'md5')
+hashes$new_probability <- sapply(hashes$new_identity, hex_to_prob)
+hashes$new_group <- 'not in test'
+hashes$new_bucket_probability <- one_in(hashes$new_probability, 10)
+hashes$new_group[1/10 >= hashes$new_probability] <- 'in test'
+hashes$new_group[hashes$new_group == 'in test' & hashes$new_bucket_probability < 0.5] <- 'control'
+hashes$new_group[hashes$new_group == 'in test' & hashes$new_bucket_probability >= 0.5] <- 'test'
+```
+
+```{r eda_5}
+ggplot(data = keep_where(hashes, new_group != 'not in test'),
+       aes(x = source, fill = new_group)) +
+  geom_bar(position = "dodge") + theme_bw() +
+  scale_y_continuous(name = "queries") +
+  ggtitle("Queries by source and bucket (group)")
+```
+
+Looks good! Let's test for association.
+
+```{r independence_3, echo = FALSE}
+hashes %>%
+  keep_where(new_group != 'not in test') %>%
+  with(table(source, new_group)) %T>%
+  { print(prop.table(., margin = 1)) } %>%
+  test_indepen
+```
+
+There is no evidence of association!
